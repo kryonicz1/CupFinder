@@ -17,9 +17,9 @@ export default function App() {
     { fps: 30 }
   ]);
 
-  // NOTE: Model input assumed 320x320. Verify with https://netron.app if detections seem wrong.
-  // This is a custom cup-only model. If swapping to a multi-class model (e.g. COCO),
-  // you must also check outputs[1] (classes) to filter for cup detections only.
+  // COCO SSD MobileNet model — input 300x300 uint8, outputs SSD format.
+  // COCO uses 80 object categories with non-contiguous IDs spanning 1–90.
+  // Cup = class ID 47. We filter for it in the frame processor.
   const model = useTensorflowModel(require('./assets/coffee_cup_detector.tflite'));
   const actualModel = model.state === 'loaded' ? model.model : undefined;
   const { resize } = useResizePlugin();
@@ -31,6 +31,20 @@ export default function App() {
   const lastHapticRef = useRef(0);
   const isPlayingRef = useRef(false);
   const successTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const hasLoggedFirstInference = useRef(false);
+
+  // Log model state changes
+  useEffect(() => {
+    if (model.state === 'loaded') {
+      console.log('[CupFinder] Model loaded successfully');
+      console.log('[CupFinder] Inputs:', JSON.stringify(model.model.inputs));
+      console.log('[CupFinder] Outputs:', JSON.stringify(model.model.outputs));
+    } else if (model.state === 'error') {
+      console.error('[CupFinder] Model failed to load:', model.error);
+    } else {
+      console.log('[CupFinder] Model state:', model.state);
+    }
+  }, [model.state]);
 
   // Request permission on mount
   useEffect(() => {
@@ -106,14 +120,14 @@ export default function App() {
           break;
       }
     } catch (e) {
-      // Haptic failed, non-fatal
+      console.warn('[CupFinder] Haptic playback failed:', e);
     } finally {
       isPlayingRef.current = false;
     }
   }, []);
 
   // Start a repeating haptic timer for the given pattern.
-  // Seeking repeats every 2s; directional patterns repeat every 800ms.
+  // Seeking repeats every 2s; directional patterns repeat every 300ms.
   const startRepeatTimer = useCallback((pattern: HapticPattern) => {
     if (retriggerTimerRef.current) clearInterval(retriggerTimerRef.current);
     if (seekingTimerRef.current) clearInterval(seekingTimerRef.current);
@@ -125,7 +139,7 @@ export default function App() {
     } else if (pattern !== 'success') {
       retriggerTimerRef.current = setInterval(() => {
         if (!foundCupRef.current) playHaptic(patternRef.current);
-      }, 800);
+      }, 300);
     }
   }, [playHaptic]);
 
@@ -142,6 +156,11 @@ export default function App() {
   useEffect(() => {
     startRepeatTimer('seeking');
   }, [startRepeatTimer]);
+
+  // Log diagnostics from the worklet thread back to JS
+  const logFromWorklet = useRunOnJS((msg: string) => {
+    console.log(msg);
+  }, []);
 
   // Handle detection results from worklet
   const handleDetection = useRunOnJS((pattern: HapticPattern) => {
@@ -171,7 +190,7 @@ export default function App() {
     }
   }, [playHaptic, startRepeatTimer]);
 
-  // Frame processor - runs ML inference on a separate thread.
+  // Frame processor — runs ML inference on the worklet thread.
   // actualModel is extracted outside the worklet so only the loaded model
   // object (a plain host object, safe to access from the worklet) is captured,
   // not the reactive model.state hook value.
@@ -183,75 +202,103 @@ export default function App() {
     runAtTargetFps(10, () => {
       'worklet';
 
-      try {
-        // Resize frame for model (verify dimensions with Netron if needed)
-        const resized = resize(frame, {
-          scale: { width: 320, height: 320 },
-          pixelFormat: 'rgb',
-          dataType: 'uint8',
-        });
+      // Resize frame to model input dimensions
+      const resized = resize(frame, {
+        scale: { width: 300, height: 300 },
+        pixelFormat: 'rgb',
+        dataType: 'uint8',
+      });
 
-        // Run inference
-        const outputs = actualModel.runSync([resized]);
+      // Run inference
+      const outputs = actualModel.runSync([resized]);
 
-        // Parse SSD outputs: [boxes, classes, scores, numDetections]
-        const boxes = outputs[0] as Float32Array;
-        const scores = outputs[2] as Float32Array;
-        const numDetections = outputs[3] as Float32Array;
-
-        const count = Math.min(Math.round(numDetections[0]), scores.length);
-
-        // Find best detection above threshold
-        let bestScore = 0.6;
-        let bestIndex = -1;
-        for (let i = 0; i < count; i++) {
-          if (scores[i] > bestScore) {
-            bestScore = scores[i];
-            bestIndex = i;
-          }
-        }
-
-        if (bestIndex === -1) {
-          handleDetection('seeking');
-          return;
-        }
-
-        // Parse bounding box [ymin, xmin, ymax, xmax]
-        const offset = bestIndex * 4;
-        const xmin = boxes[offset + 1];
-        const xmax = boxes[offset + 3];
-        const ymin = boxes[offset];
-        const ymax = boxes[offset + 2];
-
-        const width = xmax - xmin;
-        const centerX = xmin + width / 2;
-        const area = width * (ymax - ymin);
-
-        // Determine pattern based on position and size
-        let pattern: HapticPattern;
-
-        // Determine distance: area > 15% of frame = near
-        const isNear = area > 0.15;
-
-        // Success: centered and near
-        if (centerX > 0.33 && centerX < 0.67 && isNear) {
-          pattern = 'success';
-        }
-        // Direction + distance: divide frame into thirds
-        else if (centerX < 0.33) {
-          pattern = isNear ? 'left_near' : 'left_far';
-        } else if (centerX > 0.67) {
-          pattern = isNear ? 'right_near' : 'right_far';
-        } else {
-          pattern = isNear ? 'center_near' : 'center_far';
-        }
-
-        handleDetection(pattern);
-      } catch (e) {
-        // Inference error, non-fatal
+      // Validate we got the expected number of output tensors
+      if (outputs.length < 4) {
+        logFromWorklet('[CupFinder] ERROR: Expected 4 output tensors, got ' + outputs.length);
+        return;
       }
+
+      const boxes = outputs[0];
+      const classes = outputs[1];
+      const scores = outputs[2];
+      const numDetections = outputs[3];
+
+      // Log first successful inference for diagnostics
+      if (!hasLoggedFirstInference.current) {
+        hasLoggedFirstInference.current = true;
+        logFromWorklet(
+          '[CupFinder] First inference OK — outputs: ' +
+          'boxes[' + boxes.length + '] ' +
+          'classes[' + classes.length + '] ' +
+          'scores[' + scores.length + '] ' +
+          'numDet[' + numDetections.length + '] ' +
+          'numDetections=' + numDetections[0] + ' ' +
+          'topClass=' + classes[0] + ' ' +
+          'topScore=' + scores[0]
+        );
+      }
+
+      const count = Math.min(Math.round(numDetections[0]), scores.length);
+
+      // COCO class ID for "cup" is 47 (80 categories, non-contiguous IDs 1–90)
+      const CUP_CLASS_ID = 47;
+
+      // Find best cup detection above threshold
+      let bestScore = 0.4;
+      let bestIndex = -1;
+      for (let i = 0; i < count; i++) {
+        if (Math.round(classes[i]) === CUP_CLASS_ID && scores[i] > bestScore) {
+          bestScore = scores[i];
+          bestIndex = i;
+        }
+      }
+
+      if (bestIndex === -1) {
+        handleDetection('seeking');
+        return;
+      }
+
+      // Parse bounding box — SSD format: [ymin, xmin, ymax, xmax] normalized 0–1
+      const offset = bestIndex * 4;
+
+      // Validate offset is within bounds
+      if (offset + 3 >= boxes.length) {
+        logFromWorklet('[CupFinder] ERROR: Box offset ' + offset + ' out of bounds (boxes.length=' + boxes.length + ')');
+        handleDetection('seeking');
+        return;
+      }
+
+      const ymin = boxes[offset];
+      const xmin = boxes[offset + 1];
+      const ymax = boxes[offset + 2];
+      const xmax = boxes[offset + 3];
+
+      const width = xmax - xmin;
+      const centerX = xmin + width / 2;
+      const area = width * (ymax - ymin);
+
+      // Determine distance: area > 15% of frame = near
+      const isNear = area > 0.15;
+
+      // Determine pattern based on position and size
+      let pattern: HapticPattern;
+
+      // Success: centered and near
+      if (centerX > 0.33 && centerX < 0.67 && isNear) {
+        pattern = 'success';
+      }
+      // Direction + distance: divide frame into thirds
+      else if (centerX < 0.33) {
+        pattern = isNear ? 'left_near' : 'left_far';
+      } else if (centerX > 0.67) {
+        pattern = isNear ? 'right_near' : 'right_far';
+      } else {
+        pattern = isNear ? 'center_near' : 'center_far';
+      }
+
+      handleDetection(pattern);
     });
-  }, [actualModel, resize, handleDetection]);
+  }, [actualModel, resize, handleDetection, logFromWorklet]);
 
   // Loading or error: show black screen
   if (!hasPermission || model.state !== 'loaded' || !device || !format) {
